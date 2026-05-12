@@ -406,6 +406,49 @@
 		};
 	};
 
+	/*
+	 * SMSM — Shared Memory State Machine.
+	 * Provides single-bit state sharing between AP and modem for
+	 * BAM-DMUX power control.
+	 *
+	 * mboxes: one entry per remote host (index = host id).
+	 *   host 0: local (apps) — no outgoing IPC needed.
+	 *   host 1: modem — write BIT(13) to apcs_glb IPC register.
+	 *
+	 * GIC SPI 69 = modem SMSM interrupt to AP (modem writes its
+	 * SMSM state bits and kicks the AP via its IPC register).
+	 */
+	smsm: smsm {
+		compatible = "qcom,smsm";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		mboxes = <0>, <&apcs_glb 13>;
+
+		/*
+		 * Shikra modem firmware uses 5 hosts in the SMSM subscription
+		 * matrix. SMEM_SMSM_SIZE_INFO is not populated by the boot
+		 * firmware on this platform, so provide the count explicitly
+		 * to avoid the upstream default of 3 causing a size mismatch
+		 * in SMEM_SMSM_CPU_INTR_MASK (id 333).
+		 */
+		qcom,num-hosts = <5>;
+
+		apps_smsm: apps@0 {
+			reg = <0>;
+			#qcom,smem-state-cells = <1>;
+		};
+
+		modem_smsm: modem@1 {
+			reg = <1>;
+			interrupts = <GIC_SPI 69 IRQ_TYPE_EDGE_RISING>;
+
+			interrupt-controller;
+			#interrupt-cells = <2>;
+		};
+	};
+
 	soc: soc@0 {
 		compatible = "simple-bus";
 
@@ -2236,6 +2279,24 @@
 			};
 		};
 
+		/*
+		 * A2 BAM DMA controller — modem-side data BAM.
+		 * "powered-remotely": modem powers this BAM; the AP must not
+		 * access BAM registers until the modem asserts SMSM pc bit.
+		 * The qcom,bam-dmux driver acquires DMA channels only after
+		 * receiving the pc IRQ (bam_dmux_power_on).
+		 */
+		bam_dmux_dma: dma-controller@6044000 {
+			compatible = "qcom,bam-v1.7.0";
+			reg = <0x0 0x06044000 0x0 0x19000>;
+			interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>;
+			#dma-cells = <1>;
+			qcom,ee = <0>;
+			num-channels = <6>;
+			qcom,num-ees = <1>;
+			qcom,powered-remotely;
+		};
+
 		remoteproc_mpss: remoteproc@6080000 {
 			compatible = "qcom,shikra-mpss-pas";
 			reg = <0x0 0x06080000 0x0 0x100>;
@@ -2275,6 +2336,37 @@
 				mboxes = <&apcs_glb 12>;
 				qcom,remote-pid = <1>;
 				label = "mpss";
+			};
+
+			/*
+			 * BAM-DMUX: modem data channels over the A2 BAM.
+			 *
+			 * Interrupts (from modem SMSM entry, via modem_smsm
+			 * IRQ domain):
+			 *   "pc"     — bit 1 (0x2):   modem signals BAM on/off.
+			 *   "pc-ack" — bit 11 (0x800): modem acks AP power vote.
+			 *
+			 * SMEM states (written by AP into apps SMSM entry):
+			 *   "pc"     — bit 1:  AP requests UL power-on.
+			 *   "pc-ack" — bit 11: AP acks modem power-state change.
+			 *
+			 * DMA pipes 4 (TX: AP→modem) and 5 (RX: modem→AP).
+			 */
+			bam-dmux {
+				compatible = "qcom,bam-dmux";
+
+				interrupts-extended =
+					<&modem_smsm 1  IRQ_TYPE_EDGE_BOTH>,
+					<&modem_smsm 11 IRQ_TYPE_EDGE_BOTH>;
+				interrupt-names = "pc", "pc-ack";
+
+				qcom,smem-states =
+					<&apps_smsm 1>,
+					<&apps_smsm 11>;
+				qcom,smem-state-names = "pc", "pc-ack";
+
+				dmas = <&bam_dmux_dma 4>, <&bam_dmux_dma 5>;
+				dma-names = "tx", "rx";
 			};
 		};
 
