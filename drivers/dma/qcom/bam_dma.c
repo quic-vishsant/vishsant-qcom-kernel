@@ -857,6 +857,57 @@ static int bam_resume(struct dma_chan *chan)
 }
 
 /**
+ * bam_update_rx_result - account for bytes received by completed descriptors
+ * @bchan: bam channel
+ * @async_desc: descriptor whose hardware descriptors have completed
+ *
+ * On a producer pipe the BAM writes the number of bytes it transferred back
+ * into the size field of each completed descriptor in the FIFO. Report the
+ * unused part of the buffers as residue, so that clients using
+ * callback_result know how much data was received. Only the last descriptor
+ * of a transfer may be short, otherwise the transfer is marked as aborted.
+ * Clients that rely on the residue should therefore use a single buffer of
+ * at most BAM_FIFO_SIZE bytes per transfer. The residue is undefined if the
+ * result is not DMA_TRANS_NOERROR.
+ */
+static void bam_update_rx_result(struct bam_chan *bchan,
+				 struct bam_async_desc *async_desc)
+{
+	struct bam_desc_hw *fifo = PTR_ALIGN(bchan->fifo_virt,
+					    sizeof(struct bam_desc_hw));
+	u32 i;
+
+	if (async_desc->dir != DMA_DEV_TO_MEM)
+		return;
+
+	/* Read the written back sizes only after reading BAM_P_SW_OFSTS */
+	dma_rmb();
+
+	for (i = 0; i < async_desc->xfer_len; i++) {
+		u16 expected = le16_to_cpu(async_desc->curr_desc[i].size);
+		u16 received = le16_to_cpu(fifo[(bchan->head + i) %
+						 MAX_DESCRIPTORS].size);
+
+		if (received > expected) {
+			async_desc->vd.tx_result.result = DMA_TRANS_WRITE_FAILED;
+			async_desc->vd.tx_result.residue += expected;
+			continue;
+		}
+
+		/*
+		 * The next descriptor writes from its own address, so a short
+		 * write before the last one leaves a hole in the buffer that
+		 * cannot be described by the residue.
+		 */
+		if (received < expected && i != async_desc->num_desc - 1 &&
+		    async_desc->vd.tx_result.result == DMA_TRANS_NOERROR)
+			async_desc->vd.tx_result.result = DMA_TRANS_ABORTED;
+
+		async_desc->vd.tx_result.residue += expected - received;
+	}
+}
+
+/**
  * process_channel_irqs - processes the channel interrupts
  * @bdev: bam controller
  *
@@ -902,6 +953,8 @@ static u32 process_channel_irqs(struct bam_device *bdev)
 			/* Not enough data to read */
 			if (avail < async_desc->xfer_len)
 				break;
+
+			bam_update_rx_result(bchan, async_desc);
 
 			/* manage FIFO */
 			bchan->head += async_desc->xfer_len;
