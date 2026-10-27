@@ -36,6 +36,9 @@
 #define BAM_DMUX_HDR_MAGIC		0x33fc
 #define BAM_DMUX_LEN_FROM_DMA		0xffff
 
+/* Signal bits in OPEN commands */
+#define BAM_DMUX_OPEN_QMAP		BIT(1)
+
 #define BAM_DMUX_AUTOSUSPEND_DELAY	1000
 #define BAM_DMUX_REMOTE_TIMEOUT		msecs_to_jiffies(2000)
 
@@ -94,6 +97,7 @@ struct bam_dmux {
 	struct work_struct tx_wakeup_work;
 
 	DECLARE_BITMAP(remote_channels, BAM_DMUX_NUM_CH);
+	DECLARE_BITMAP(remote_qmap, BAM_DMUX_NUM_CH);
 	struct work_struct register_netdev_work;
 	struct net_device *netdevs[BAM_DMUX_NUM_CH];
 };
@@ -253,6 +257,8 @@ static int bam_dmux_send_cmd(struct bam_dmux_netdev *bndev, u8 cmd)
 	hdr->magic = BAM_DMUX_HDR_MAGIC;
 	hdr->cmd = cmd;
 	hdr->ch = bndev->ch;
+	if (cmd == BAM_DMUX_CMD_OPEN && test_bit(bndev->ch, dmux->remote_qmap))
+		hdr->signal = BAM_DMUX_OPEN_QMAP;
 
 	skb_dma = bam_dmux_tx_queue(dmux, skb);
 	if (!skb_dma) {
@@ -558,13 +564,17 @@ static void bam_dmux_cmd_open(struct bam_dmux *dmux, struct bam_dmux_hdr *hdr)
 {
 	struct net_device *netdev = dmux->netdevs[hdr->ch];
 
-	dev_dbg(dmux->dev, "open channel: %u\n", hdr->ch);
+	dev_dbg(dmux->dev, "open channel: %u (signal %#x)\n", hdr->ch,
+		hdr->signal);
 	trace_bam_dmux_channel(dmux->dev, hdr->ch, "remote_open");
 
 	if (__test_and_set_bit(hdr->ch, dmux->remote_channels)) {
 		dev_warn(dmux->dev, "Channel already open: %u\n", hdr->ch);
 		return;
 	}
+
+	/* Use QMAP on our side of the channel only if the remote supports it */
+	assign_bit(hdr->ch, dmux->remote_qmap, hdr->signal & BAM_DMUX_OPEN_QMAP);
 
 	if (netdev) {
 		netif_device_attach(netdev);
