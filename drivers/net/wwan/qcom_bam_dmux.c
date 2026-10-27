@@ -34,6 +34,7 @@
 #define BAM_DMUX_NUM_SKB		32
 
 #define BAM_DMUX_HDR_MAGIC		0x33fc
+#define BAM_DMUX_LEN_FROM_DMA		0xffff
 
 #define BAM_DMUX_AUTOSUSPEND_DELAY	1000
 #define BAM_DMUX_REMOTE_TIMEOUT		msecs_to_jiffies(2000)
@@ -476,7 +477,8 @@ static void bam_dmux_register_netdev_work(struct work_struct *work)
 	}
 }
 
-static void bam_dmux_rx_callback(void *data);
+static void bam_dmux_rx_callback(void *data,
+				 const struct dmaengine_result *result);
 
 static bool bam_dmux_skb_dma_submit_rx(struct bam_dmux_skb_dma *skb_dma)
 {
@@ -491,7 +493,7 @@ static bool bam_dmux_skb_dma_submit_rx(struct bam_dmux_skb_dma *skb_dma)
 		return false;
 	}
 
-	desc->callback = bam_dmux_rx_callback;
+	desc->callback_result = bam_dmux_rx_callback;
 	desc->callback_param = skb_dma;
 	desc->cookie = dmaengine_submit(desc);
 	return true;
@@ -510,21 +512,23 @@ static bool bam_dmux_skb_dma_queue_rx(struct bam_dmux_skb_dma *skb_dma, gfp_t gf
 	       bam_dmux_skb_dma_submit_rx(skb_dma);
 }
 
-static void bam_dmux_cmd_data(struct bam_dmux_skb_dma *skb_dma)
+static void bam_dmux_cmd_data(struct bam_dmux_skb_dma *skb_dma,
+			      unsigned int rx_len)
 {
 	struct bam_dmux *dmux = skb_dma->dmux;
 	struct sk_buff *skb = skb_dma->skb;
 	struct bam_dmux_hdr *hdr = (struct bam_dmux_hdr *)skb->data;
 	struct net_device *netdev = dmux->netdevs[hdr->ch];
+	unsigned int avail = rx_len - sizeof(*hdr);
 
 	if (!netdev || !netif_running(netdev)) {
 		dev_warn(dmux->dev, "Data for inactive channel %u\n", hdr->ch);
 		return;
 	}
 
-	if (hdr->len > BAM_DMUX_MAX_DATA_SIZE) {
-		dev_err(dmux->dev, "Data larger than buffer? (%u > %u)\n",
-			hdr->len, (u16)BAM_DMUX_MAX_DATA_SIZE);
+	if (hdr->len > avail) {
+		dev_err(dmux->dev, "Data larger than received? (%u > %u)\n",
+			hdr->len, avail);
 		return;
 	}
 
@@ -586,14 +590,28 @@ static void bam_dmux_cmd_close(struct bam_dmux *dmux, struct bam_dmux_hdr *hdr)
 		netif_device_detach(netdev);
 }
 
-static void bam_dmux_rx_callback(void *data)
+static void bam_dmux_rx_callback(void *data,
+				 const struct dmaengine_result *result)
 {
 	struct bam_dmux_skb_dma *skb_dma = data;
 	struct bam_dmux *dmux = skb_dma->dmux;
 	struct sk_buff *skb = skb_dma->skb;
 	struct bam_dmux_hdr *hdr = (struct bam_dmux_hdr *)skb->data;
+	unsigned int rx_len;
 
 	bam_dmux_skb_dma_unmap(skb_dma, DMA_FROM_DEVICE);
+
+	if (result->result != DMA_TRANS_NOERROR || result->residue > skb->len) {
+		dev_err(dmux->dev, "RX DMA failed: %d (residue %u)\n",
+			result->result, result->residue);
+		goto out;
+	}
+
+	rx_len = skb->len - result->residue;
+	if (rx_len < sizeof(*hdr)) {
+		dev_err(dmux->dev, "RX shorter than header: %u\n", rx_len);
+		goto out;
+	}
 
 	if (hdr->magic != BAM_DMUX_HDR_MAGIC) {
 		dev_err(dmux->dev, "Invalid magic in header: %#x\n", hdr->magic);
@@ -605,11 +623,15 @@ static void bam_dmux_rx_callback(void *data)
 		goto out;
 	}
 
+	/* The remote side may leave it to us to use the DMA transfer size */
+	if (hdr->cmd == BAM_DMUX_CMD_DATA && hdr->len == BAM_DMUX_LEN_FROM_DMA)
+		hdr->len = rx_len - sizeof(*hdr);
+
 	trace_bam_dmux_rx(dmux->dev, hdr->ch, hdr->cmd, hdr->len);
 
 	switch (hdr->cmd) {
 	case BAM_DMUX_CMD_DATA:
-		bam_dmux_cmd_data(skb_dma);
+		bam_dmux_cmd_data(skb_dma, rx_len);
 		break;
 	case BAM_DMUX_CMD_OPEN:
 		bam_dmux_cmd_open(dmux, hdr);
